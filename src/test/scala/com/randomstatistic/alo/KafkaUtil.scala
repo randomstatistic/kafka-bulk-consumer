@@ -5,7 +5,7 @@ import java.net.{ServerSocket, InetSocketAddress}
 import kafka.server.{KafkaServer, KafkaConfig}
 import kafka.producer.{ProducerConfig, Producer}
 import java.util.Properties
-import kafka.serializer.StringEncoder
+import kafka.serializer.{DefaultEncoder, StringEncoder}
 import java.io.File
 import scala.util.Random
 import kafka.admin.AdminUtils
@@ -31,14 +31,17 @@ class KafkaUtil {
   println("Broker port: " + brokerPort)
   val brokerStr = s"localhost:$brokerPort"
 
-
   val testTopic = "someTopic"
   val testGroupId = "group1"
 
-  AdminUtils.createTopic(broker.zkClient, testTopic, 10, 1)
-  waitUntilMetadataIsPropagated(Seq(broker), testTopic, 1, 5000)
 
-  val producer = new Producer[String, String](new ProducerConfig(getProducerConfig(brokerStr)))
+  def createTopic(topic: String) = {
+    AdminUtils.createTopic(broker.zkClient, topic, 10, 1)
+    waitUntilMetadataIsPropagated(Seq(broker), topic, 1, 5000)
+  }
+  createTopic(testTopic)
+
+  val producer = new Producer[String, Array[Byte]](new ProducerConfig(getProducerConfig(brokerStr)))
 
   def shutdown() {
     producer.close()
@@ -46,6 +49,10 @@ class KafkaUtil {
     zkServer.shutdown()
     zkServerFactory.shutdown()
   }
+
+  // The following was stolen almost verbatim from here:
+  // https://github.com/apache/kafka/blob/0.8.1/core/src/test/scala/unit/kafka/utils/TestUtils.scala
+  // because kafka doesn't publish a test artifact
 
   def IoTmpDir = System.getProperty("java.io.tmpdir")
 
@@ -63,6 +70,7 @@ class KafkaUtil {
     sock.close()
     port
   }
+
   def createBrokerConfig(nodeId: Int, zkConnect: String, port: Int = availPort): Properties = {
     val props = new Properties
     props.put("broker.id", nodeId.toString)
@@ -100,8 +108,9 @@ class KafkaUtil {
     props.put("retry.backoff.ms", "1000")
     props.put("request.timeout.ms", "500")
     props.put("request.required.acks", "-1")  // all in-sync replicas
-    props.put("serializer.class", classOf[StringEncoder].getName.toString)
-
+    props.put("serializer.class", classOf[DefaultEncoder].getName)
+    props.put("key.serializer.class", classOf[StringEncoder].getName)
+    // TODO: producer.sync?
     props
   }
 
@@ -117,7 +126,7 @@ class KafkaUtil {
         return true
       if (System.currentTimeMillis() > startTime + waitTime)
         return false
-      println("Waiting for condition")
+      //println("Waiting for condition")
       Thread.sleep(waitTime.min(100L))
     }
     // should never hit here

@@ -9,8 +9,14 @@ import scala.collection.mutable
 import com.sun.tools.javac.comp.Todo
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future}
-import com.randomstatistic.alo.BatchingActor.{AckableMessage, GetMessage, QueueData, Serving}
+import com.randomstatistic.alo.BatchingActor._
 import scala.util.{Failure, Success}
+import kafka.producer.KeyedMessage
+import scala.util.Failure
+import scala.Some
+import com.randomstatistic.alo.BatchingActor.QueueData
+import scala.util.Success
+import com.randomstatistic.alo.BatchingActor.AckableMessage
 
 object BatchingActor {
   trait State
@@ -22,6 +28,13 @@ object BatchingActor {
   case object QuiesceComplete
   case object CompactComplete
   case object CommitComplete
+
+  case class BatchingConfig(
+    maxInFlight: Int = 15,
+    quiescePeriod: FiniteDuration = 1.second,
+    maxTimeBetweenCommit: Duration = Duration.Inf,
+    opportunisticCommitThreshold: Int = 8
+  )
 
 
   // map id to:
@@ -41,9 +54,15 @@ object BatchingActor {
     def ack(id: UUID) = updateIfExists(id, Some(true))
     def nack(id: UUID) = updateIfExists(id, Some(false))
     def clear = this.copy(inFlight = inFlight.empty)
-    def unhandled = inFlight.filter{ case (id, (msg, ackState)) => ackState.isEmpty || !ackState.get }
+    def unhandled = inFlight.filter{
+      case (id, (msg, ackState)) => ackState.isEmpty || !ackState.get
+    }.map {
+      case ((id, (msg, ackState))) => msg
+    }
   }
 
+  case object GetInFlightCount
+  case class InFlightCount(count: Int)
   case object GetMessage
   trait Acknowledgement { val id: UUID }
   case class Ack(id: UUID) extends Acknowledgement
@@ -51,14 +70,14 @@ object BatchingActor {
 
   case class AckableMessage[T](id: UUID, msg: T)
 
-  case class KafkaConnection(consumer: ConsumerConnector, stream: ConsumerIterator[String, Array[Byte]], producer: Producer[String, Array[Byte]])
+  case class KafkaConnection(consumer: ConsumerConnector, stream: SlightlyBetterConsumerIterator[String, Array[Byte]], producer: Producer[String, Array[Byte]])
 
   def getConnection(topic: String, groupId: String, consumerProperties: Properties, producerProperties: Properties) = {
     consumerProperties.setProperty("group.id", groupId)  // TODO: Should we be overriding here?
     val connector: ConsumerConnector = Consumer.create(new ConsumerConfig(consumerProperties))
     val stream: KafkaStream[String, Array[Byte]] =
       connector.createMessageStreams(Map(topic -> 1), new StringDecoder(), new DefaultDecoder()).apply(topic).head
-    val msgIterator = stream.iterator()
+    val msgIterator = SlightlyBetterConsumerIterator(stream.iterator())
 
     val connection = KafkaConnection(
       connector,
@@ -78,14 +97,12 @@ object BatchingActor {
 }
 
 
-class BatchingActor(topic: String, groupId: String, consumerProps: Properties, producerProps: Properties) extends Actor with FSM[BatchingActor.State, BatchingActor.QueueData[Array[Byte]]] {
+class BatchingActor(topic: String, groupId: String, consumerProps: Properties, producerProps: Properties, config: BatchingConfig = new BatchingConfig()) extends Actor with FSM[BatchingActor.State, BatchingActor.QueueData[Array[Byte]]] {
   type MsgContent = Array[Byte] // If you change this, change the FSM mixin type too
   import BatchingActor._
   import context.dispatcher
 
-  val maxSize = 15
-
-  startWith(Serving, QueueData(getConnection("test topic", "groupId", consumerProps, producerProps), Map[UUID, (MsgContent, Option[Boolean])]()))
+  startWith(Serving, QueueData(getConnection(topic, groupId, consumerProps, producerProps), Map[UUID, (MsgContent, Option[Boolean])]()))
 
   whenUnhandled {
     // any state except Serving pretends there are no messages
@@ -93,6 +110,7 @@ class BatchingActor(topic: String, groupId: String, consumerProps: Properties, p
     // multiple states accept acks
     case Event(Ack(id), d) => stay using d.ack(id)
     case Event(Nack(id), d) => stay using d.nack(id)
+    case Event(GetInFlightCount, d) => stay replying InFlightCount(d.inFlight.size)
   }
 
   // TODO: Probably want some functional distinctions between these
@@ -105,8 +123,8 @@ class BatchingActor(topic: String, groupId: String, consumerProps: Properties, p
   when(Serving) {
     case Event(GetMessage, d) => {
       val id = UUID.randomUUID()
-      
-      val msgOpt = if (d.conn.stream.hasNext())
+
+      val msgOpt = if (d.conn.stream.hasNext)   // Careful, can block for consumer.timeout.ms
         Some(AckableMessage[MsgContent](id, d.conn.stream.next().message()))
       else
         None
@@ -116,11 +134,15 @@ class BatchingActor(topic: String, groupId: String, consumerProps: Properties, p
         case Some(msg) => d + msg
       }
 
-      val newState = if (d.inFlight.size < maxSize)
+      val newState = if (newData.inFlight.size < config.maxInFlight) {
         stay
-      else
+      }
+      else {
         goto(Quiescing)
-      
+      }
+
+      // TODO: Duration-based state transition
+      // TODO: Opportunistic state transition
       newState using newData replying msgOpt
     }
 
@@ -128,7 +150,7 @@ class BatchingActor(topic: String, groupId: String, consumerProps: Properties, p
 
   onTransition {
     case Serving -> Quiescing => {
-      setTimer("quiesce", QuiesceComplete, 1.second)
+      setTimer("quiesce", QuiesceComplete, config.quiescePeriod)
     }
     case Quiescing -> x => {
       cancelTimer("quiesce")
@@ -145,12 +167,9 @@ class BatchingActor(topic: String, groupId: String, consumerProps: Properties, p
       val unhandled = nextStateData.unhandled
       val producer = nextStateData.conn.producer
       val requeueF = Future {
-        unhandled.values.foreach {   // consider .par.foreach?
-          // TODO: I copied this from elsewhere, but is "topic" really the right key?
-          //case (msg, _) => producer.send(new KeyedMessage[String, MsgContent](topic, msg))
-          // Trying "null" instead, which with the DefaultPartinitioner means "random partition"
-          case (msg, _) => producer.send(new KeyedMessage[String, MsgContent](null, msg))
-        }
+        unhandled.foreach(msg =>  // consider .par.foreach?
+          producer.send(new KeyedMessage[String, MsgContent](topic, msg))
+        )
       }.onComplete{
         case Success(_) => self ! CompactComplete
         case Failure(e) => throw new RuntimeException("Couldn't requeue", e)

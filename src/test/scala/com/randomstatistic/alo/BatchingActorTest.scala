@@ -7,15 +7,23 @@ import org.apache.zookeeper.server.{NIOServerCnxn, ZooKeeperServer}
 import java.io.File
 import java.net.{ServerSocket, InetSocketAddress}
 import kafka.server.{KafkaConfig, KafkaServer}
-import java.util.Properties
+import java.util.{UUID, Properties}
 import scala.util.Random
 import kafka.serializer.{DefaultDecoder, StringDecoder, StringEncoder}
 import kafka.producer.{KeyedMessage, Producer, ProducerConfig}
 import kafka.consumer._
 import kafka.admin.AdminUtils
 import kafka.producer.KeyedMessage
-import com.randomstatistic.alo.BatchingActor.{AckableMessage, GetMessage, Serving}
+import com.randomstatistic.alo.BatchingActor._
 import scala.concurrent.duration._
+import akka.actor.FSM.{Transition, CurrentState, SubscribeTransitionCallBack}
+import com.randomstatistic.alo.BatchingActor.InFlightCount
+import kafka.producer.KeyedMessage
+import akka.actor.FSM.Transition
+import akka.actor.FSM.CurrentState
+import scala.Some
+import com.randomstatistic.alo.BatchingActor.AckableMessage
+import akka.actor.FSM.SubscribeTransitionCallBack
 
 class BatchingActorTest extends FunSpec with TestKitBase with ShouldMatchers with BeforeAndAfterAll with ImplicitSender {
 
@@ -38,124 +46,117 @@ class BatchingActorTest extends FunSpec with TestKitBase with ShouldMatchers wit
       }
       it("should produce and consume") {
         val connector = Consumer.create(new ConsumerConfig(
-          createConsumerProperties(kafka.zkConnectString, kafka.testGroupId, "1"))
+          kafka.createConsumerProperties(kafka.zkConnectString, kafka.testGroupId, "1"))
         )
         val stream: KafkaStream[String, String] =
           connector.createMessageStreams(Map(kafka.testTopic -> 1), new StringDecoder(), new StringDecoder()).apply(kafka.testTopic).head
-        val msgIterator = stream.iterator()
+        val msgIterator = SlightlyBetterConsumerIterator(stream.iterator())
 
-        kafka.producer.send(new KeyedMessage[String,String](kafka.testTopic, "keystr", "valstr"))
-        msgIterator.hasNext() should be(true)
+        kafka.producer.send(new KeyedMessage[String,Array[Byte]](kafka.testTopic, "keystr", "valstr".getBytes))
+        Thread.sleep(100)
+        msgIterator.hasNext should be(true)
         msgIterator.next().message() should be("valstr")
-        msgIterator.hasNext() should be(false)
+        msgIterator.hasNext should be(false)
         connector.commitOffsets
         connector.shutdown()
       }
     }
 
     describe("when consuming") {
+      def msg = new KeyedMessage[String, Array[Byte]]("consuming", UUID.randomUUID().toString.getBytes)
+      val maxInFlight = 4
+      val quiescePeriod = 100.millis
+      lazy val consumerProps = kafka.createConsumerProperties(kafka.zkConnectString, "ignored", "2")
+      lazy val producerProps = kafka.getProducerConfig(kafka.brokerStr)
+      lazy val batchingConfig = BatchingActor.BatchingConfig(maxInFlight = maxInFlight, quiescePeriod = quiescePeriod)
+      lazy val fsm = {
+        kafka.createTopic("consuming")
+        TestFSMRef(new BatchingActor("consuming", kafka.testGroupId, consumerProps, producerProps, batchingConfig))
+      }
+      lazy val ba: TestActorRef[BatchingActor] = fsm
+
       it("should respond None when empty") {
-        val consumerProps = createConsumerProperties(kafka.zkConnectString, "bogus", "2")
-        val producerProps = getProducerConfig(kafka.brokerStr)
-        val fsm = TestFSMRef(new BatchingActor(kafka.testTopic, "myGroup", consumerProps, producerProps))
-        val ba: TestActorRef[BatchingActor] = fsm
         fsm.stateName should be(Serving)
         ba ! GetMessage
         expectMsg(100.millis, None)
       }
-//      it("should respond with a message when there is one") {
-//        val msg = new KeyedMessage[String, String](testTopic, "keystr", "valstr")
-//        producer.send(msg)
-//        Thread.sleep(100)
-//        ba ! GetMessage
-//        expectMsgClass(100.millis, AckableMessage.getClass)
-//      }
+      it("should respond with a message when there is one") {
+        fsm.stateName should be(Serving)
+        kafka.producer.send(msg)
+        Thread.sleep(100)
+        ba ! GetMessage
+        expectMsgPF(100.millis, "got the message") {
+          case Some(AckableMessage(_, a)) => a
+        }
+      }
+      it("should transition due to maxInFlight") {
+        fsm.stateName should be(Serving)
+        // watch the transitions
+        val probe = TestProbe()
+        ba ! SubscribeTransitionCallBack(probe.ref)
+        probe.expectMsgPF(100.millis, "got the current state") {
+          case CurrentState(ref, Serving) => ref
+        }
+
+        // figure out how many more messages are needed to trigger a transition
+        ba ! GetInFlightCount
+        val inFlight = expectMsgPF(100.millis, "got the count") {
+          case InFlightCount(count) => count
+        }
+        val transitionsAfter = maxInFlight - inFlight
+        transitionsAfter should be > 1
+
+        // trigger a Serving -> Quiescing
+        Range(0,transitionsAfter).foreach(x => kafka.producer.send(msg))
+        Thread.sleep(100)
+        val newMessages = Range(0,transitionsAfter).map(x => {
+          ba ! GetMessage
+          expectMsgPF(100.millis, "got the message") {
+            case Some(a: AckableMessage[Array[Byte]]) => a
+          }
+        }).toSet
+        val queueSize = inFlight + transitionsAfter
+        ba ! Ack(newMessages.head.id) // positively acknowledge the first one, leave the rest
+
+        probe.expectMsgPF(100.millis, "got the transition to Quiescing") {
+          case Transition(ref, Serving, Quiescing) => ref
+        }
+
+        // wait for a Quiescing -> Compacting
+        probe.expectMsgPF(200.millis, "got the transition to Compacting") {
+          case Transition(ref, Quiescing, Compacting) => ref
+        }
+
+        // wait for a Compacting -> Committing
+        probe.expectMsgPF(1.second, "got the transition to Committing") {
+          case Transition(ref, Compacting, Committing) => ref
+        }
+
+        // wait for a Committing -> Serving
+        probe.expectMsgPF(1.second, "got the transition to Serving again") {
+          case Transition(ref, Committing, Serving) => ref
+        }
+
+        // messages that weren't acked should show up again
+        var unseen = newMessages.tail.map(x => new String(x.msg))
+        //println("looking for " + unseen)
+        Range(0,queueSize - 1).foreach( x => {   // we acked 1 of them
+          ba ! GetMessage
+          expectMsgPF(100.millis, "got the message") {
+            case Some(AckableMessage(id, a: Array[Byte])) => {
+              val asStr = new String(a)
+              if (unseen.contains(asStr)) {
+                unseen = unseen - asStr
+              }
+              //println("Got " + asStr)
+            }
+          }
+        })
+        unseen.size should be(0)
+
+      }
     }
 
   }
-
-  // A lot of the following was stolen from here:
-  // https://github.com/apache/kafka/blob/0.8.1/core/src/test/scala/unit/kafka/utils/TestUtils.scala
-  // because kafka doesn't publish a test artifact
-
-
-  def IoTmpDir = System.getProperty("java.io.tmpdir")
-
-  def tempDir(str: String = "batching-actor-test"): File = {
-    val f = new File(IoTmpDir, str + "-" + Random.nextInt(1000000))
-    f.mkdirs()
-    f.deleteOnExit() // TODO: Doesn't seem to be working
-    f
-  }
-
-  def availPort = {
-    // seriously? this is the best practice?
-    val sock = new ServerSocket(0)
-    val port = sock.getLocalPort
-    sock.close()
-    port
-  }
-
-  def createBrokerConfig(nodeId: Int, zkConnect: String, port: Int = availPort): Properties = {
-    val props = new Properties
-    props.put("broker.id", nodeId.toString)
-    props.put("host.name", "localhost")
-    props.put("port", port.toString)
-    props.put("log.dir", tempDir().getAbsolutePath)
-    props.put("zookeeper.connect", zkConnect)
-    props.put("replica.socket.timeout.ms", "1500")
-    props.put("num.partitions", "100") // changes the default, used by auto-created topics
-    props
-  }
-
-  def createConsumerProperties(zkConnect: String, groupId: String, consumerId: String,
-                               consumerTimeout: Long = -1): Properties = {
-    val props = new Properties
-    props.put("zookeeper.connect", zkConnect)
-    props.put("group.id", groupId)
-    props.put("consumer.id", consumerId)
-    props.put("consumer.timeout.ms", consumerTimeout.toString)
-    props.put("zookeeper.session.timeout.ms", "400")
-    props.put("zookeeper.sync.time.ms", "200")
-    //props.put("auto.commit.interval.ms", "1000")
-    props.put("rebalance.max.retries", "4")
-    props.put("auto.offset.reset", "smallest")
-    props.put("num.consumer.fetchers", "2")
-
-    props
-  }
-
-  def getProducerConfig(brokerList: String, partitioner: String = "kafka.producer.DefaultPartitioner"): Properties = {
-    val props = new Properties()
-    props.put("metadata.broker.list", brokerList)
-    props.put("partitioner.class", partitioner)
-    props.put("message.send.max.retries", "3")
-    props.put("retry.backoff.ms", "1000")
-    props.put("request.timeout.ms", "500")
-    props.put("request.required.acks", "-1")  // all in-sync replicas
-    props.put("serializer.class", classOf[StringEncoder].getName.toString)
-
-    props
-  }
-
-  def waitUntilMetadataIsPropagated(servers: Seq[KafkaServer], topic: String, partition: Int, timeout: Long): Boolean = {
-      waitUntilTrue(() =>
-        servers.foldLeft(true)(_ && _.apis.metadataCache.containsTopicAndPartition(topic, partition)), timeout)
-  }
-
-  def waitUntilTrue(condition: () => Boolean, waitTime: Long): Boolean = {
-    val startTime = System.currentTimeMillis()
-    while (true) {
-      if (condition())
-        return true
-      if (System.currentTimeMillis() > startTime + waitTime)
-        return false
-      println("Waiting for condition")
-      Thread.sleep(waitTime.min(100L))
-    }
-    // should never hit here
-    throw new RuntimeException("unexpected error")
-  }
-
 
 }
