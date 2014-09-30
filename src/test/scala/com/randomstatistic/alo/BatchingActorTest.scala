@@ -112,7 +112,7 @@ class BatchingActorTest extends FunSpec with TestKitBase with ShouldMatchers wit
         val newMessages = Range(0,transitionsAfter).map(x => {
           ba ! GetMessage
           expectMsgPF(100.millis, "got the message") {
-            case Some(a: AckableMessage[Array[Byte]]) => a
+            case Some(a: AckableMessage[BatchingActor.MsgContent]@unchecked) => a
           }
         }).toSet
         val queueSize = inFlight + transitionsAfter
@@ -138,13 +138,13 @@ class BatchingActorTest extends FunSpec with TestKitBase with ShouldMatchers wit
         }
 
         // messages that weren't acked should show up again
-        var unseen = newMessages.tail.map(x => new String(x.msg))
+        var unseen = newMessages.tail.map(x => new String(x.msg.message()))
         //println("looking for " + unseen)
         Range(0,queueSize - 1).foreach( x => {   // we acked 1 of them
           ba ! GetMessage
           expectMsgPF(100.millis, "got the message") {
-            case Some(AckableMessage(id, a: Array[Byte])) => {
-              val asStr = new String(a)
+            case Some(AckableMessage(id, a: BatchingActor.MsgContent)) => {
+              val asStr = new String(a.message())
               if (unseen.contains(asStr)) {
                 unseen = unseen - asStr
               }

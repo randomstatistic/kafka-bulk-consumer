@@ -1,6 +1,6 @@
 package com.randomstatistic.alo
 
-import akka.actor.{Props, FSM, Actor}
+import akka.actor.{PoisonPill, Props, FSM, Actor}
 import java.util.{UUID, Properties}
 import kafka.consumer._
 import kafka.producer.{KeyedMessage, ProducerConfig, Producer}
@@ -17,6 +17,7 @@ import scala.Some
 import com.randomstatistic.alo.BatchingActor.QueueData
 import scala.util.Success
 import com.randomstatistic.alo.BatchingActor.AckableMessage
+import kafka.message.MessageAndMetadata
 
 object BatchingActor {
   trait State
@@ -30,6 +31,7 @@ object BatchingActor {
   case object CommitComplete
 
   case class BatchingConfig(
+    idGenerator: () => UUID = () => UUID.randomUUID(),
     maxInFlight: Int = 15,
     quiescePeriod: FiniteDuration = 1.second,
     maxTimeBetweenCommit: Duration = Duration.Inf,
@@ -69,6 +71,7 @@ object BatchingActor {
   case class Nack(id: UUID) extends Acknowledgement
 
   case class AckableMessage[T](id: UUID, msg: T)
+  type MsgContent = MessageAndMetadata[String, Array[Byte]] // If you change this, change the FSM mixin type too
 
   case class KafkaConnection(consumer: ConsumerConnector, stream: SlightlyBetterConsumerIterator[String, Array[Byte]], producer: Producer[String, Array[Byte]])
 
@@ -92,13 +95,13 @@ object BatchingActor {
     conn.producer.close()
   }
 
-  def apply(topic: String, groupId: String, consumerProps: Properties, producerProps: Properties) =
-    Props(new BatchingActor(topic, groupId, consumerProps, producerProps))
+  def props(topic: String, groupId: String, consumerProps: Properties, producerProps: Properties, config: BatchingConfig = new BatchingConfig()) =
+    Props(new BatchingActor(topic, groupId, consumerProps, producerProps, config))
 }
 
 
-class BatchingActor(topic: String, groupId: String, consumerProps: Properties, producerProps: Properties, config: BatchingConfig = new BatchingConfig()) extends Actor with FSM[BatchingActor.State, BatchingActor.QueueData[Array[Byte]]] {
-  type MsgContent = Array[Byte] // If you change this, change the FSM mixin type too
+class BatchingActor(topic: String, groupId: String, consumerProps: Properties, producerProps: Properties, config: BatchingConfig = new BatchingConfig()) extends Actor with FSM[BatchingActor.State, BatchingActor.QueueData[MsgContent]] {
+
   import BatchingActor._
   import context.dispatcher
 
@@ -120,12 +123,14 @@ class BatchingActor(topic: String, groupId: String, consumerProps: Properties, p
     case StopEvent(FSM.Failure(cause), state, data) => closeConnection(data.conn)
   }
 
+  protected def nextMsg(d: QueueData[MsgContent]) = d.conn.stream.next()
+
   when(Serving) {
     case Event(GetMessage, d) => {
-      val id = UUID.randomUUID()
+      val id = config.idGenerator()
 
-      val msgOpt = if (d.conn.stream.hasNext)   // Careful, can block for consumer.timeout.ms
-        Some(AckableMessage[MsgContent](id, d.conn.stream.next().message()))
+      val msgOpt = if (d.conn.stream.hasNext)   // Careful, can block for consumer.timeout.ms!
+        Some(AckableMessage[MsgContent](id, nextMsg(d)))
       else
         None
 
@@ -149,7 +154,7 @@ class BatchingActor(topic: String, groupId: String, consumerProps: Properties, p
   }
 
   onTransition {
-    case Serving -> Quiescing => {
+    case x -> Quiescing => {
       setTimer("quiesce", QuiesceComplete, config.quiescePeriod)
     }
     case Quiescing -> x => {
@@ -162,17 +167,19 @@ class BatchingActor(topic: String, groupId: String, consumerProps: Properties, p
   }
 
   onTransition {
-    case Quiescing -> Compacting => {
+    case x -> Compacting => {
       setTimer("compact", StateTimeout, 1.second)
       val unhandled = nextStateData.unhandled
       val producer = nextStateData.conn.producer
       val requeueF = Future {
         unhandled.foreach(msg =>  // consider .par.foreach?
-          producer.send(new KeyedMessage[String, MsgContent](topic, msg))
+          producer.send(new KeyedMessage[String, Array[Byte]](topic, msg.key, msg.message))
         )
       }.onComplete{
         case Success(_) => self ! CompactComplete
-        case Failure(e) => throw new RuntimeException("Couldn't requeue", e)
+        case Failure(e) =>
+          //Couldn't requeue
+          self ! PoisonPill
       }
     }
     case Compacting -> x => {
@@ -191,13 +198,15 @@ class BatchingActor(topic: String, groupId: String, consumerProps: Properties, p
   }
 
   onTransition {
-    case Compacting -> Committing => {
+    case x -> Committing => {
       setTimer("commit", StateTimeout, 1.second)
       Future {
         nextStateData.conn.consumer.commitOffsets
       }.onComplete {
         case Success(_) => self ! CommitComplete
-        case Failure(e) => throw new RuntimeException("Couldn't commit offsets", e)
+        case Failure(e) =>
+          //Couldn't commit offsets
+          self ! PoisonPill
       }
     }
     case Committing -> x => {
