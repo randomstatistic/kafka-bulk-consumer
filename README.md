@@ -18,7 +18,7 @@ per-message delivery guarantee.
 
 So you could:
 * Set the batch size to 1
-* Instantiate multiple consumer instances
+* Instantiate multiple kafka consumers
 
 But if you assume most message processing is successful, this hurts your processing rate, since you're 
 throwing out most of kafka's per-client-instance processing speed. Further, the number of consumer 
