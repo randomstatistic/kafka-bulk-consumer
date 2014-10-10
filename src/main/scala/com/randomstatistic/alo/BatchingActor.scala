@@ -3,43 +3,54 @@ package com.randomstatistic.alo
 import akka.actor.{PoisonPill, Props, FSM, Actor}
 import java.util.{UUID, Properties}
 import kafka.consumer._
-import kafka.producer.{KeyedMessage, ProducerConfig, Producer}
+import kafka.producer.{ProducerConfig, Producer}
 import kafka.serializer.{DefaultDecoder, StringDecoder}
-import scala.collection.mutable
-import com.sun.tools.javac.comp.Todo
 import scala.concurrent.duration._
 import scala.concurrent.{ExecutionContext, Future}
 import com.randomstatistic.alo.BatchingActor._
-import scala.util.{Failure, Success}
+import scala.util.Success
 import kafka.producer.KeyedMessage
 import scala.util.Failure
 import scala.Some
-import com.randomstatistic.alo.BatchingActor.QueueData
 import scala.util.Success
-import com.randomstatistic.alo.BatchingActor.AckableMessage
 import kafka.message.MessageAndMetadata
 
 object BatchingActor {
+  // FSM state management classes
   trait State
   case object Serving extends State
   case object Quiescing extends State
   case object Compacting extends State
   case object Committing extends State
-
   case object QuiesceComplete
   case object CompactComplete
   case object CommitComplete
 
+  // collection of config options
   case class BatchingConfig(
     idGenerator: () => UUID = () => UUID.randomUUID(),
     maxInFlight: Int = 15,
     quiescePeriod: FiniteDuration = 1.second,
     maxTimeBetweenCommit: Duration = Duration.Inf,
-    opportunisticCommitThreshold: Int = 8
+    opportunisticCommitThreshold: Int = 8,
+    replyAsParent: Boolean = false
   )
 
+  // administrative & testing related messages
+  case object GetInFlightCount
+  case class InFlightCount(count: Int)
 
-  // map id to:
+  // first-class API messages
+  case object GetMessage
+  trait Acknowledgement { val id: UUID }
+  case class Ack(id: UUID) extends Acknowledgement
+  case class Nack(id: UUID) extends Acknowledgement
+  case class AckableMessage[T](id: UUID, msg: T)
+
+
+  // Encapsulates the data associated with a given FSM state, including the kafka connection reference.
+  // Otherwise, this just consists of tracking the outstanding messages awaiting acknowledgement, which
+  // is stored in a map of id to:
   //  case None => no ack/nack received
   //  case Some(true) => acked
   //  case Some(false) => nacked
@@ -63,15 +74,8 @@ object BatchingActor {
     }
   }
 
-  case object GetInFlightCount
-  case class InFlightCount(count: Int)
-  case object GetMessage
-  trait Acknowledgement { val id: UUID }
-  case class Ack(id: UUID) extends Acknowledgement
-  case class Nack(id: UUID) extends Acknowledgement
-
-  case class AckableMessage[T](id: UUID, msg: T)
-  type MsgContent = MessageAndMetadata[String, Array[Byte]] // If you change this, change the FSM mixin type too
+  // Kafka management
+  type MsgContent = MessageAndMetadata[String, Array[Byte]]
 
   case class KafkaConnection(consumer: ConsumerConnector, stream: SlightlyBetterConsumerIterator[String, Array[Byte]], producer: Producer[String, Array[Byte]])
 
@@ -129,7 +133,7 @@ class BatchingActor(topic: String, groupId: String, consumerProps: Properties, p
     case Event(GetMessage, d) => {
       val id = config.idGenerator()
 
-      val msgOpt = if (d.conn.stream.hasNext)   // Careful, can block for consumer.timeout.ms!
+      val msgOpt = if (d.conn.stream.hasNext)   // WARNING: can *block* for consumer.timeout.ms!
         Some(AckableMessage[MsgContent](id, nextMsg(d)))
       else
         None
@@ -139,16 +143,20 @@ class BatchingActor(topic: String, groupId: String, consumerProps: Properties, p
         case Some(msg) => d + msg
       }
 
-      val newState = if (newData.inFlight.size < config.maxInFlight) {
-        stay
-      }
-      else {
-        goto(Quiescing)
-      }
+      val newState: State =
+        if (newData.inFlight.size < config.maxInFlight)
+          stay
+        else
+          goto(Quiescing)
+
+      if (config.replyAsParent)
+        sender().tell(msgOpt, context.parent)
+      else
+        sender ! msgOpt
 
       // TODO: Duration-based state transition
       // TODO: Opportunistic state transition
-      newState using newData replying msgOpt
+      newState using newData
     }
 
   }
