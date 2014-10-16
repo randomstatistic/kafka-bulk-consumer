@@ -11,8 +11,14 @@ import scala.concurrent.duration._
 import akka.actor.FSM.{Transition, SubscribeTransitionCallBack}
 
 
+case class BulkConsumerConfig(
+  idGenerator: MaskedUUIDGenerator = MaskedUUIDGenerator(1),
+  consumerProps: Properties = new Properties,
+  producerProps: Properties = new Properties
+)
 
 object BulkConsumer {
+  def defaultBatchingConfig = BulkConsumerConfig()
 
 }
 
@@ -23,54 +29,17 @@ object BulkConsumer {
  * @param groupId
  * @tparam T
  */
-class BulkConsumer[T](topic: String, groupId: String) extends Actor {
+class BulkConsumer[T](topic: String, groupId: String, config: BulkConsumerConfig = BulkConsumer.defaultBatchingConfig) extends Actor {
   import BatchingActor._
 
-  case class MaskedUUIDGenerator(maskLen: Int) {
-    require(maskLen <= 3) // let's not get out of control here, 3 means 3360 masks
-
-    type IdGenerator = () => UUID
-    def nextGenerator = {
-      val nextMask = masksItr.next()
-      (nextMask, maskedIdGenerator(nextMask))
-    }
-
-    def maskedIdGenerator(mask: String): IdGenerator = {
-      require(mask.forall(c => c.toString.matches("[a-fA-F0-9]")))
-      require(mask.length == maskLen)
-      val re = "^" + "." * mask.length
-      val reC = Pattern.compile(re)
-
-      () => {
-        val matcher = reC.matcher(UUID.randomUUID().toString)
-        val masked = matcher.replaceFirst(mask)
-        UUID.fromString(masked)
-      }
-    }
-
-    def getMask(uuid: UUID) = {
-      uuid.toString.substring(0, maskLen)
-    }
-
-    val masks: List[String] = {
-      val charRange = (('0' to '9') ++ ('a' to 'f')).map(_.toString).toList
-      val combinations =
-        charRange.combinations(maskLen).map(_.permutations).flatten.map(_.mkString)
-      combinations.toList
-    }
-
-    val masksItr = masks.toIterator
-
-  }
 
   val decider: Decider = {
     case _: ActorInitializationException => Restart // kafka connection happens during initialization
   }
   override val supervisorStrategy = OneForOneStrategy()(decider.orElse(SupervisorStrategy.defaultDecider))
 
-  val consumerProps = new Properties()
-  val producerProps = new Properties()
-  val baseConfig = new BatchingActor.BatchingConfig()
+  val consumerProps = config.consumerProps
+  val producerProps = config.producerProps
   val idGenerator = MaskedUUIDGenerator(1)
 
   def batchingActor(generator: () => UUID) =
@@ -79,24 +48,24 @@ class BulkConsumer[T](topic: String, groupId: String) extends Actor {
       groupId,
       consumerProps,
       producerProps,
-      baseConfig.copy(idGenerator = generator)
+      new BatchingConfig(idGenerator = generator)
     ).withDispatcher("bulk-consumer.pinned-dispatcher"))
 
-  implicit val actorOrdering = Ordering.fromLessThan[ActorRef](_.hashCode() > _.hashCode()) // random, but deterministic
-  val activeBatchers = mutable.TreeSet.empty[ActorRef]
-  val inactiveBatchers = mutable.TreeSet.empty[ActorRef]
+  val batchers = mutable.Queue.empty[ActorRef]
   val routes = mutable.Map.empty[String,ActorRef]
+  val servingStatus = mutable.Map.empty[ActorRef, Boolean].withDefaultValue(false)
   
   val addConsumerCooldown = 10.seconds.toMillis
   var lastConsumerAddition = System.currentTimeMillis() - addConsumerCooldown
   tryAddConsumer // get the ball rolling
 
   def tryAddConsumer {
-    if (System.currentTimeMillis() - lastConsumerAddition >= addConsumerCooldown) {
-      val (mask, generator) = idGenerator.nextGenerator
+    if (System.currentTimeMillis() - lastConsumerAddition >= addConsumerCooldown && idGenerator.generators.hasNext) {
+      val (mask, generator) = idGenerator.generators.next()
       val newConsumer = batchingActor(generator)
 
-      routes += Pair(mask, newConsumer)
+      routes += ((mask, newConsumer))
+      batchers.enqueue(newConsumer)
       context.watch(newConsumer)
       newConsumer ! SubscribeTransitionCallBack(self)
 
@@ -104,32 +73,51 @@ class BulkConsumer[T](topic: String, groupId: String) extends Actor {
     }
   }
   def removeConsumer(ref: ActorRef) {
-    activeBatchers.remove(ref)
-    inactiveBatchers.remove(ref)
+    batchers.dequeueFirst(_ == ref)
     val routeKeys = routes.filter{
       case (k, v) => ref == v
     }.map(_._1)
     routeKeys.foreach(routes.remove)
   }
 
-  def markInactive(ref: ActorRef) {
-    inactiveBatchers.add(ref)
-    activeBatchers.remove(ref)
-  }
-  def markActive(ref: ActorRef) {
-    activeBatchers.add(ref)
-    inactiveBatchers.remove(ref)
+  def markInactive(ref: ActorRef) = servingStatus(ref) = false
+  def markActive(ref: ActorRef)   = servingStatus(ref) = true
+
+  def activeBatcher: Option[ActorRef] = {
+
+    def findActive(stopOn: ActorRef): Option[ActorRef] = {
+      if (batchers.head == stopOn) {
+        None
+      }
+      else if (servingStatus(batchers.head)) {
+        Some(batchers.head)
+      }
+      else {
+        batchers.enqueue(batchers.dequeue)
+        findActive(stopOn)
+      }
+    }
+
+    if (servingStatus(batchers.head)) {
+      Some(batchers.head)
+    }
+    else {
+      val stopOn = batchers.dequeue
+      batchers.enqueue(stopOn)
+      findActive(stopOn)
+    }
   }
 
   override def receive: Receive = {
     case GetMessage =>
-      if (activeBatchers.size > 0) {
-        activeBatchers.head.forward(GetMessage)
+      activeBatcher match {
+        case Some(batcher) =>
+          batcher.forward(GetMessage)
+        case None =>
+          tryAddConsumer
+          sender ! None
       }
-      else {
-        if (routes.size < idGenerator.masks.length) tryAddConsumer
-        sender ! None
-      }
+
     case a: Acknowledgement =>
       routes.get(idGenerator.getMask(a.id)).map( routee => routee.forward(a) )
 
