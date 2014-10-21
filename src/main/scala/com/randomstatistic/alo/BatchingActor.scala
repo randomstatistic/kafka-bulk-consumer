@@ -30,7 +30,7 @@ object BatchingActor {
   case class BatchingConfig(
     idGenerator: () => UUID = () => UUID.randomUUID(),
     maxInFlight: Int = 15,
-    quiescePeriod: FiniteDuration = 1.second,
+    quiescePeriod: FiniteDuration = 3.second,
     maxTimeBetweenCommit: Duration = Duration.Inf,
     opportunisticCommitThreshold: Int = 8,
     replyAsParent: Boolean = false

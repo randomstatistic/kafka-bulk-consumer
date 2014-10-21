@@ -14,12 +14,15 @@ import akka.actor.FSM.{Transition, SubscribeTransitionCallBack}
 case class BulkConsumerConfig(
   idGenerator: MaskedUUIDGenerator = MaskedUUIDGenerator(1),
   consumerProps: Properties = new Properties,
-  producerProps: Properties = new Properties
+  producerProps: Properties = new Properties,
+  addConsumerCooldown: FiniteDuration = 30.seconds
 )
 
 object BulkConsumer {
   def defaultBatchingConfig = BulkConsumerConfig()
 
+  def props(topic: String, groupId: String, config: BulkConsumerConfig = BulkConsumer.defaultBatchingConfig) =
+    Props(new BulkConsumer(topic, groupId, config))
 }
 
 /**
@@ -27,9 +30,8 @@ object BulkConsumer {
  * Routers need to be thread-safe, so that gets more tricky.
  * @param topic
  * @param groupId
- * @tparam T
  */
-class BulkConsumer[T](topic: String, groupId: String, config: BulkConsumerConfig = BulkConsumer.defaultBatchingConfig) extends Actor {
+class BulkConsumer(topic: String, groupId: String, config: BulkConsumerConfig = BulkConsumer.defaultBatchingConfig) extends Actor {
   import BatchingActor._
 
 
@@ -55,9 +57,9 @@ class BulkConsumer[T](topic: String, groupId: String, config: BulkConsumerConfig
   val routes = mutable.Map.empty[String,ActorRef]
   val servingStatus = mutable.Map.empty[ActorRef, Boolean].withDefaultValue(false)
   
-  val addConsumerCooldown = 10.seconds.toMillis
+  val addConsumerCooldown = config.addConsumerCooldown.toMillis
   var lastConsumerAddition = System.currentTimeMillis() - addConsumerCooldown
-  tryAddConsumer // get the ball rolling
+
 
   def tryAddConsumer {
     if (System.currentTimeMillis() - lastConsumerAddition >= addConsumerCooldown && idGenerator.generators.hasNext) {
@@ -68,6 +70,7 @@ class BulkConsumer[T](topic: String, groupId: String, config: BulkConsumerConfig
       batchers.enqueue(newConsumer)
       context.watch(newConsumer)
       newConsumer ! SubscribeTransitionCallBack(self)
+      servingStatus(newConsumer) = true
 
       lastConsumerAddition = System.currentTimeMillis()
     }
@@ -87,6 +90,7 @@ class BulkConsumer[T](topic: String, groupId: String, config: BulkConsumerConfig
 
     def findActive(stopOn: ActorRef): Option[ActorRef] = {
       if (batchers.head == stopOn) {
+        // looped the batchers list without finding an active batcher
         None
       }
       else if (servingStatus(batchers.head)) {
@@ -98,14 +102,22 @@ class BulkConsumer[T](topic: String, groupId: String, config: BulkConsumerConfig
       }
     }
 
-    if (servingStatus(batchers.head)) {
-      Some(batchers.head)
+    if (batchers.isEmpty) {
+      None
+    }
+    else if (servingStatus(batchers.head)) {
+      Some(batchers.head) // use the front of the queue to get messages until we can't
     }
     else {
-      val stopOn = batchers.dequeue
-      batchers.enqueue(stopOn)
-      findActive(stopOn)
+      // rotate the front of the queue to the back until the front is usable, or we do a complete cycle
+      val checked = batchers.dequeue
+      batchers.enqueue(checked)
+      findActive(checked)
     }
+  }
+
+  override def preStart() = {
+    tryAddConsumer
   }
 
   override def receive: Receive = {
