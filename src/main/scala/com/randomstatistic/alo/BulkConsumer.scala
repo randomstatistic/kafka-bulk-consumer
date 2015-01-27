@@ -9,13 +9,15 @@ import scala.collection.mutable
 import scala.concurrent.duration._
 
 import akka.actor.FSM.{Transition, SubscribeTransitionCallBack}
+import com.randomstatistic.alo.BatchingActor.BatchingConfig
 
 
 case class BulkConsumerConfig(
   idGenerator: MaskedUUIDGenerator = MaskedUUIDGenerator(1),
   consumerProps: Properties = new Properties,
   producerProps: Properties = new Properties,
-  addConsumerCooldown: FiniteDuration = 30.seconds
+  addConsumerCooldown: FiniteDuration = 30.seconds,
+  batchingConfig: BatchingConfig = BatchingConfig()
 )
 
 object BulkConsumer {
@@ -42,7 +44,7 @@ class BulkConsumer(topic: String, groupId: String, config: BulkConsumerConfig = 
 
   val consumerProps = config.consumerProps
   val producerProps = config.producerProps
-  val idGenerator = MaskedUUIDGenerator(1)
+  val idGenerator = config.idGenerator
 
   def batchingActor(generator: () => UUID) =
     context.actorOf(BatchingActor.props(
@@ -50,7 +52,7 @@ class BulkConsumer(topic: String, groupId: String, config: BulkConsumerConfig = 
       groupId,
       consumerProps,
       producerProps,
-      new BatchingConfig(idGenerator = generator)
+      config.batchingConfig.copy(idGenerator = generator)
     ).withDispatcher("bulk-consumer.pinned-dispatcher"))
 
   val batchers = mutable.Queue.empty[ActorRef]
@@ -83,7 +85,13 @@ class BulkConsumer(topic: String, groupId: String, config: BulkConsumerConfig = 
     routeKeys.foreach(routes.remove)
   }
 
-  def markInactive(ref: ActorRef) = servingStatus(ref) = false
+  def markInactive(ref: ActorRef) {
+    servingStatus(ref) = false
+    if (servingStatus.forall( _._2 == false ))
+      tryAddConsumer
+    if (batchers.head == ref)
+      batchers.enqueue(batchers.dequeue)
+  }
   def markActive(ref: ActorRef)   = servingStatus(ref) = true
 
   def activeBatcher: Option[ActorRef] = {
@@ -134,7 +142,8 @@ class BulkConsumer(topic: String, groupId: String, config: BulkConsumerConfig = 
       routes.get(idGenerator.getMask(a.id)).map( routee => routee.forward(a) )
 
     case Transition(actorRef, BatchingActor.Serving, newState) => markInactive(actorRef)
-    case Transition(actorRef, oldState, BatchingActor.Serving) => markActive(actorRef)  
+    case Transition(actorRef, oldState, BatchingActor.Serving) => markActive(actorRef)
+    case Transition(actorRef, oldState, newState) => Unit
     case Terminated(ref) => removeConsumer(ref)
 
   }

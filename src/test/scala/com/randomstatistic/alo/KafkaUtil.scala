@@ -83,12 +83,10 @@ class KafkaUtil {
     props
   }
 
-  def createConsumerProperties(zkConnect: String, groupId: String, consumerId: String,
-                               consumerTimeout: Long = 100): Properties = {
+  def createConsumerProperties(zkConnect: String, groupId: String, consumerTimeout: Long = 100): Properties = {
     val props = new Properties
     props.put("zookeeper.connect", zkConnect)
     props.put("group.id", groupId)
-    props.put("consumer.id", consumerId)
     props.put("consumer.timeout.ms", consumerTimeout.toString)
     props.put("zookeeper.session.timeout.ms", "400")
     props.put("zookeeper.sync.time.ms", "200")

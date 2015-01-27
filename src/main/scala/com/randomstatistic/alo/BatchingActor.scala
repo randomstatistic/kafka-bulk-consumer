@@ -208,8 +208,9 @@ class BatchingActor(topic: String, groupId: String, consumerProps: Properties, p
   onTransition {
     case x -> Committing => {
       setTimer("commit", StateTimeout, 1.second)
+      val conn = nextStateData.conn
       Future {
-        nextStateData.conn.consumer.commitOffsets
+        conn.consumer.commitOffsets
       }.onComplete {
         case Success(_) => self ! CommitComplete
         case Failure(e) =>

@@ -46,7 +46,7 @@ class BatchingActorTest extends FunSpec with TestKitBase with ShouldMatchers wit
       }
       it("should produce and consume") {
         val connector = Consumer.create(new ConsumerConfig(
-          kafka.createConsumerProperties(kafka.zkConnectString, kafka.testGroupId, "1"))
+          kafka.createConsumerProperties(kafka.zkConnectString, kafka.testGroupId))
         )
         val stream: KafkaStream[String, String] =
           connector.createMessageStreams(Map(kafka.testTopic -> 1), new StringDecoder(), new StringDecoder()).apply(kafka.testTopic).head
@@ -66,7 +66,7 @@ class BatchingActorTest extends FunSpec with TestKitBase with ShouldMatchers wit
       def msg = new KeyedMessage[String, Array[Byte]]("consuming", UUID.randomUUID().toString.getBytes)
       val maxInFlight = 4
       val quiescePeriod = 100.millis
-      lazy val consumerProps = kafka.createConsumerProperties(kafka.zkConnectString, "ignored", "2")
+      lazy val consumerProps = kafka.createConsumerProperties(kafka.zkConnectString, "ignored")
       lazy val producerProps = kafka.getProducerConfig(kafka.brokerStr)
       lazy val batchingConfig = BatchingActor.BatchingConfig(maxInFlight = maxInFlight, quiescePeriod = quiescePeriod)
       lazy val fsm = {
